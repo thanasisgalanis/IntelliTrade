@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Phase 1 MVP scope: trade Forex news events by collecting articles from NewsAPI, analysing them with Anthropic Claude, gating signals through a strict risk manager, and executing market orders on MetaTrader 5.
 
-> Phase 1 source code currently lives on branch `feature/phase-1-news-trading-mvp` (commit `e4656d1`) and has not yet been merged to `main`. On `main` the working tree only carries leftover `__pycache__/` directories from a prior checkout — switch branches to see the actual code.
+> Phase 1 source code currently lives on branch `feature/phase-1-news-trading-mvp` (commit `c77ef9c`) and has not yet been merged to `main`. On `main` the working tree only carries leftover `__pycache__/` directories from a prior checkout — switch branches to see the actual code.
 
 Per the project's working agreement (`context/0-initial-prompt.md`): each new phase starts on its own git branch and is merged to `main` only when the phase is verified complete.
 
@@ -34,6 +34,9 @@ trading_system/
 │   │                    # per pair (_analyze_pair / _BATCH_SYSTEM_PROMPT);
 │   │                    # results are deduplicated by pair, highest-confidence
 │   │                    # wins. Ephemeral prompt caching on both system prompts.
+│   │                    # Each API call logs: model, mode (single/batch), pair,
+│   │                    # article count + IDs (pre-call) and sentiment,
+│   │                    # confidence, token usage (post-call).
 │   ├── risk_manager/    # FixedPercentRiskManager — enforces 1%-of-free-margin
 │   │                    # sizing and a min-confidence gate (default 0.70)
 │   └── execution_engine/# MT5ExecutionEngine + MT5BrokerInfo adapter.
@@ -93,3 +96,8 @@ Runtime config is loaded from `.env` via `python-dotenv`. See `.env.example` for
 `git@github.com:thanasisgalanis/IntelliTrade.git`
 
 > Note: the GitHub repo is spelled **IntelliTrade** (double-l) while the local working directory is `InteliTrade` (single-l). Worth aligning eventually.
+
+
+## Rules
+
+- Always ask to update claude.md (this file), after any change in our code, so it reflects the current status of our codebase.
