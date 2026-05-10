@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Phase 1 MVP scope: trade Forex news events by collecting articles from NewsAPI, analysing them with Anthropic Claude, gating signals through a strict risk manager, and executing market orders on MetaTrader 5.
 
-> Phase 1 source code currently lives on branch `feature/phase-1-news-trading-mvp` (commit `37bb170`) and has not yet been merged to `main`. On `main` the working tree only carries leftover `__pycache__/` directories from a prior checkout — switch branches to see the actual code.
+> Phase 1 source code currently lives on branch `feature/phase-1-news-trading-mvp` (commit `e4656d1`) and has not yet been merged to `main`. On `main` the working tree only carries leftover `__pycache__/` directories from a prior checkout — switch branches to see the actual code.
 
 Per the project's working agreement (`context/0-initial-prompt.md`): each new phase starts on its own git branch and is merged to `main` only when the phase is verified complete.
 
@@ -21,15 +21,25 @@ trading_system/
 ├── core/
 │   ├── interfaces.py    # INewsCollector, INewsAnalyzer, IRiskManager,
 │   │                    # IExecutionEngine + domain dataclasses (NewsItem,
-│   │                    # AnalysisResult, TradeSignal, ExecutionResult)
+│   │                    # AnalysisResult, TradeSignal, ExecutionResult).
+│   │                    # INewsAnalyzer includes a default analyze_many()
+│   │                    # that subclasses may override for batching.
 │   └── logger.py        # Rotating file (5 MB × 5) + console; idempotent
 ├── modules/
 │   ├── news_collector/  # NewsApiCollector — NewsAPI → SQLite, dedup by URL hash
-│   ├── news_analyzer/   # ClaudeNewsAnalyzer — Anthropic SDK, strict JSON-only
-│   │                    # system prompt with ephemeral prompt caching
+│   ├── news_analyzer/   # ClaudeNewsAnalyzer — pre-filters articles that
+│   │                    # mention only non-allowed FX pairs (skips Claude
+│   │                    # call). analyze_many() groups remaining articles by
+│   │                    # detected pair and issues one batched Claude call
+│   │                    # per pair (_analyze_pair / _BATCH_SYSTEM_PROMPT);
+│   │                    # results are deduplicated by pair, highest-confidence
+│   │                    # wins. Ephemeral prompt caching on both system prompts.
 │   ├── risk_manager/    # FixedPercentRiskManager — enforces 1%-of-free-margin
 │   │                    # sizing and a min-confidence gate (default 0.70)
-│   └── execution_engine/# MT5ExecutionEngine + MT5BrokerInfo adapter
+│   └── execution_engine/# MT5ExecutionEngine + MT5BrokerInfo adapter.
+│                        # _select_filling_mode() reads symbol_info.filling_mode
+│                        # bitmask and picks IOC → FOK → RETURN per symbol to
+│                        # avoid retcode=10030 ("Unsupported filling mode").
 └── main.py              # End-to-end orchestrator
 tests/                   # pytest unit tests (mocked broker + mocked Anthropic SDK)
 context/                 # Free-form planning notes / prior session transcripts
