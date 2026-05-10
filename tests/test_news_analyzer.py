@@ -30,9 +30,10 @@ from trading_system.modules.news_analyzer.analyzer import ClaudeNewsAnalyzer
 def make_item(
     title: str = "ECB hints at faster rate cuts",
     description: str = "Sources suggest the ECB may accelerate cuts in Q3.",
+    article_id: str = "abc123",
 ) -> NewsItem:
     return NewsItem(
-        article_id="abc123",
+        article_id=article_id,
         source="Reuters",
         title=title,
         description=description,
@@ -312,3 +313,236 @@ def test_no_allowlist_disables_prefilter():
 
     assert result is not None
     client.messages.create.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Batched analysis — issue #3 regressions
+# (multiple articles for the same pair must collapse into one Claude call,
+#  and competing signals for one pair must dedupe to a single result.)
+# ---------------------------------------------------------------------------
+
+def test_analyze_many_groups_articles_about_same_pair_into_one_call():
+    """Three articles all naming GBP/USD must reach Claude as a single
+    batch request, producing one consolidated AnalysisResult."""
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages.create.return_value = fake_response(
+        '{"sentiment": "bullish", "confidence": 0.82, "pair": "GBPUSD"}'
+    )
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused", client=client, allowed_pairs={"GBPUSD"},
+    )
+
+    items = [
+        make_item(article_id="a1", title="GBP/USD breaks higher",
+                  description="Sterling firms vs dollar."),
+        make_item(article_id="a2", title="Cable extends rally on GBP/USD",
+                  description="Pound hits new high vs USD."),
+        make_item(article_id="a3", title="GBPUSD outlook upgraded",
+                  description="Analysts revise GBP/USD targets."),
+    ]
+
+    results = analyzer.analyze_many(items)
+
+    assert client.messages.create.call_count == 1
+    assert len(results) == 1
+    assert results[0].pair == "GBPUSD"
+    assert results[0].sentiment is Sentiment.BULLISH
+    assert results[0].confidence == pytest.approx(0.82)
+
+
+def test_analyze_many_uses_one_call_per_distinct_pair():
+    """Articles about different allowed pairs each trigger their own
+    batch call — never one shared call for unrelated pairs."""
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages.create.side_effect = [
+        fake_response('{"sentiment": "bullish", "confidence": 0.8, "pair": "GBPUSD"}'),
+        fake_response('{"sentiment": "bearish", "confidence": 0.7, "pair": "EURUSD"}'),
+    ]
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused", client=client, allowed_pairs={"GBPUSD", "EURUSD"},
+    )
+
+    items = [
+        make_item(article_id="g1", title="GBP/USD up", description="cable firms"),
+        make_item(article_id="g2", title="GBPUSD higher", description="pound up"),
+        make_item(article_id="e1", title="EUR/USD slips", description="euro down"),
+    ]
+
+    results = analyzer.analyze_many(items)
+
+    assert client.messages.create.call_count == 2
+    assert {r.pair for r in results} == {"GBPUSD", "EURUSD"}
+
+
+def test_analyze_many_falls_back_to_single_when_no_pair_token():
+    """An article with no explicit pair token can't be grouped — it must
+    still reach Claude via the single-article path."""
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages.create.return_value = fake_response(
+        '{"sentiment": "neutral", "confidence": 0.4, "pair": "EURUSD"}'
+    )
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused", client=client, allowed_pairs={"EURUSD"},
+    )
+
+    results = analyzer.analyze_many([make_item()])  # default has no pair tokens
+
+    assert client.messages.create.call_count == 1
+    assert len(results) == 1
+    assert results[0].pair == "EURUSD"
+
+
+def test_analyze_many_skips_articles_for_non_allowed_pairs():
+    """Issue #2 pre-filter still applies inside the batch flow: USD/INR
+    articles never reach the API."""
+    client = MagicMock(spec=anthropic.Anthropic)
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused", client=client, allowed_pairs={"EURUSD"},
+    )
+
+    items = [
+        make_item(article_id="x1", title="USD/INR rises", description="rupee weak"),
+        make_item(article_id="x2", title="USDINR climbs", description="dollar up"),
+    ]
+
+    assert analyzer.analyze_many(items) == []
+    client.messages.create.assert_not_called()
+
+
+def test_analyze_many_combines_grouped_and_ungrouped_paths():
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages.create.side_effect = [
+        # Batch call for the GBP/USD group
+        fake_response('{"sentiment": "bullish", "confidence": 0.8, "pair": "GBPUSD"}'),
+        # Single-article fallback (no pair token) — Claude infers EURUSD
+        fake_response('{"sentiment": "bearish", "confidence": 0.6, "pair": "EURUSD"}'),
+    ]
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused", client=client, allowed_pairs={"GBPUSD", "EURUSD"},
+    )
+
+    items = [
+        make_item(article_id="g1", title="GBP/USD news", description="cable"),
+        make_item(article_id="g2", title="GBPUSD outlook", description="sterling"),
+        make_item(article_id="u1"),  # default — no pair token, ungrouped
+    ]
+
+    results = analyzer.analyze_many(items)
+
+    assert client.messages.create.call_count == 2
+    assert {r.pair for r in results} == {"GBPUSD", "EURUSD"}
+
+
+def test_analyze_many_dedupes_by_pair_keeping_highest_confidence():
+    """If batched and ungrouped paths both yield a signal for the same
+    pair, the higher-confidence one wins — never two trades for one pair."""
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages.create.side_effect = [
+        fake_response('{"sentiment": "bullish", "confidence": 0.55, "pair": "GBPUSD"}'),
+        fake_response('{"sentiment": "bullish", "confidence": 0.85, "pair": "GBPUSD"}'),
+    ]
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused", client=client, allowed_pairs={"GBPUSD"},
+    )
+
+    items = [
+        make_item(article_id="g1", title="GBP/USD news", description="cable"),
+        make_item(article_id="u1"),  # ungrouped → individual call
+    ]
+
+    results = analyzer.analyze_many(items)
+
+    assert len(results) == 1
+    assert results[0].pair == "GBPUSD"
+    assert results[0].confidence == pytest.approx(0.85)
+
+
+def test_analyze_many_handles_malformed_batch_response():
+    """If a batch call returns garbage, that pair is dropped — other
+    pairs in the same run are unaffected."""
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages.create.side_effect = [
+        fake_response("not json"),  # GBPUSD batch fails
+        fake_response('{"sentiment": "bullish", "confidence": 0.7, "pair": "EURUSD"}'),
+    ]
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused", client=client, allowed_pairs={"GBPUSD", "EURUSD"},
+    )
+
+    items = [
+        make_item(article_id="g1", title="GBP/USD up", description="cable"),
+        make_item(article_id="e1", title="EUR/USD down", description="euro"),
+    ]
+
+    results = analyzer.analyze_many(items)
+
+    assert client.messages.create.call_count == 2
+    assert len(results) == 1
+    assert results[0].pair == "EURUSD"
+
+
+def test_analyze_many_empty_input_makes_no_api_calls():
+    client = MagicMock(spec=anthropic.Anthropic)
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused", client=client, allowed_pairs={"EURUSD"},
+    )
+
+    assert analyzer.analyze_many([]) == []
+    client.messages.create.assert_not_called()
+
+
+def test_analyze_many_overrides_pair_when_claude_misformats_it():
+    """The batch path passes the target pair to Claude and trusts our own
+    detection — not whatever the model echoes back."""
+    client = MagicMock(spec=anthropic.Anthropic)
+    # Claude returns a *different* pair than the one we asked about.
+    client.messages.create.return_value = fake_response(
+        '{"sentiment": "bullish", "confidence": 0.8, "pair": "EURUSD"}'
+    )
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused", client=client, allowed_pairs={"GBPUSD"},
+    )
+
+    items = [
+        make_item(article_id="g1", title="GBP/USD up", description="cable"),
+        make_item(article_id="g2", title="GBPUSD higher", description="pound"),
+    ]
+
+    results = analyzer.analyze_many(items)
+
+    assert len(results) == 1
+    assert results[0].pair == "GBPUSD"  # not EURUSD
+
+
+def test_analyze_many_batch_message_contains_every_article():
+    """All articles in a group must appear in the single user message —
+    otherwise Claude is consolidating from incomplete evidence."""
+    captured: dict = {}
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        return fake_response(
+            '{"sentiment": "bullish", "confidence": 0.8, "pair": "GBPUSD"}'
+        )
+
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages.create.side_effect = capture
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused", client=client, allowed_pairs={"GBPUSD"},
+    )
+
+    items = [
+        make_item(article_id="a1", title="GBP/USD breaks 1.30",
+                  description="Sterling spikes on jobs data."),
+        make_item(article_id="a2", title="Cable extends GBP/USD gains",
+                  description="Pound rallies on hawkish BoE tone."),
+    ]
+
+    analyzer.analyze_many(items)
+
+    body = captured["messages"][0]["content"]
+    assert "Target pair: GBPUSD" in body
+    assert "breaks 1.30" in body
+    assert "Cable extends GBP/USD gains" in body
+    assert "Sterling spikes on jobs data." in body
+    assert "hawkish BoE tone." in body

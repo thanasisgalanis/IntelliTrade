@@ -87,11 +87,10 @@ def run_once() -> int:
         items = collector.fetch(query=query, page_size=page_size)
         log.info("Pipeline starting on %d articles", len(items))
 
-        for item in items:
-            analysis: AnalysisResult | None = analyzer.analyze(item)
-            if analysis is None:
-                continue
+        analyses: list[AnalysisResult] = analyzer.analyze_many(items)
+        log.info("Analyzer produced %d consolidated signal(s)", len(analyses))
 
+        for analysis in analyses:
             signal = risk.evaluate(analysis, sl_pips=sl_pips, tp_pips=tp_pips)
             if signal is None:
                 continue

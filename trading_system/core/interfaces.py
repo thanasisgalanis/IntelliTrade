@@ -91,6 +91,20 @@ class INewsAnalyzer(ABC):
     def analyze(self, item: NewsItem) -> AnalysisResult | None:
         """Return a structured signal or None if analysis failed/was skipped."""
 
+    def analyze_many(self, items: list[NewsItem]) -> list[AnalysisResult]:
+        """Analyze a batch of items.
+
+        Default: per-item iteration. Implementations may override to
+        deduplicate or batch external API calls across items targeting the
+        same instrument (see issue #3).
+        """
+        results: list[AnalysisResult] = []
+        for item in items:
+            r = self.analyze(item)
+            if r is not None:
+                results.append(r)
+        return results
+
 
 class IRiskManager(ABC):
     @abstractmethod
