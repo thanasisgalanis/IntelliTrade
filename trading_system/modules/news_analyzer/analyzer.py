@@ -134,6 +134,13 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
             return None
 
         user_msg = self._build_user_message(item)
+        candidates = sorted(self._extract_pair_tokens(item)) or ["auto"]
+        log.info(
+            "Calling Claude (model=%s, mode=single) article=%s articles=1 pair_candidates=%s",
+            self._model,
+            item.article_id,
+            ",".join(candidates),
+        )
         try:
             response = self._client.messages.create(
                 model=self._model,
@@ -157,13 +164,23 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
             log.exception("Unexpected error calling Claude: %s", exc)
             return None
 
+        self._log_usage(f"single:{item.article_id}", response)
         text = self._extract_text(response)
         parsed = self._parse_json(text)
         if parsed is None:
             log.warning("Claude returned non-JSON for %s: %r", item.article_id, text[:200])
             return None
 
-        return self._validate(parsed, item.article_id)
+        result = self._validate(parsed, item.article_id)
+        if result is not None:
+            log.info(
+                "Claude result single:%s pair=%s sentiment=%s confidence=%.2f",
+                item.article_id,
+                result.pair,
+                result.sentiment.value,
+                result.confidence,
+            )
+        return result
 
     # ------------------------------------------------------------------
     # Batched analysis (issue #3)
@@ -215,6 +232,13 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
         if not items:
             return None
         tag = f"batch:{pair}({len(items)})"
+        log.info(
+            "Calling Claude (model=%s, mode=batch) pair=%s articles=%d ids=%s",
+            self._model,
+            pair,
+            len(items),
+            ",".join(item.article_id for item in items),
+        )
         try:
             response = self._client.messages.create(
                 model=self._model,
@@ -243,6 +267,7 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
             log.exception("Unexpected error calling Claude on %s: %s", tag, exc)
             return None
 
+        self._log_usage(tag, response)
         text = self._extract_text(response)
         parsed = self._parse_json(text)
         if parsed is None:
@@ -252,7 +277,15 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
         # Enforce the target pair we supplied — Claude is told to echo it,
         # but we don't trust it to do so under prompt drift.
         parsed["pair"] = pair
-        return self._validate(parsed, tag)
+        result = self._validate(parsed, tag)
+        if result is not None:
+            log.info(
+                "Claude result %s sentiment=%s confidence=%.2f",
+                tag,
+                result.sentiment.value,
+                result.confidence,
+            )
+        return result
 
     def _allowed_pair_mentions(self, item: NewsItem) -> set[str]:
         """Return the subset of explicit pair tokens in the article that
@@ -328,6 +361,20 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
                 f"    URL: {item.url}",
             ])
         return "\n".join(lines)
+
+    @staticmethod
+    def _log_usage(tag: str, response: Any) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        log.info(
+            "Claude usage %s input=%s output=%s cache_read=%s cache_create=%s",
+            tag,
+            getattr(usage, "input_tokens", "?"),
+            getattr(usage, "output_tokens", "?"),
+            getattr(usage, "cache_read_input_tokens", "?"),
+            getattr(usage, "cache_creation_input_tokens", "?"),
+        )
 
     @staticmethod
     def _extract_text(response: Any) -> str:
