@@ -31,6 +31,35 @@ _DEFAULT_TIMEOUT = 20.0  # seconds
 _REQUIRED_KEYS = {"sentiment", "confidence", "pair"}
 _VALID_SENTIMENTS = {s.value for s in Sentiment}
 
+# Three orthogonal pair-mention forms. Each is matched independently so a
+# match in one form does not consume characters that belong to another (the
+# non-overlapping behaviour of ``finditer`` would otherwise cause e.g.
+# "USD/INR AND EUR/USD" to swallow "AND EUR" between the two real pairs).
+# Both halves are post-validated against ``_FX_CURRENCIES`` to suppress
+# false positives from adjacent 3-letter acronyms (e.g. "THE ECB").
+_PAIR_RE_CONTIGUOUS = re.compile(r"\b([A-Z]{6})\b")
+_PAIR_RE_DELIMITED = re.compile(r"\b([A-Z]{3})[/\-]([A-Z]{3})\b")
+_PAIR_RE_SPACED = re.compile(r"\b([A-Z]{3})\s+([A-Z]{3})\b")
+
+# ISO 4217 codes for currencies that appear in mainstream FX coverage. The
+# list is intentionally conservative — adding a code only widens the pre-
+# filter (more articles get a Claude call), it never causes a wrongful skip.
+_FX_CURRENCIES: frozenset[str] = frozenset({
+    # Majors
+    "USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF",
+    # Asia
+    "CNY", "CNH", "HKD", "SGD", "KRW", "TWD", "INR", "IDR",
+    "MYR", "PHP", "THB", "VND", "PKR", "BDT", "LKR", "NPR",
+    # EMEA
+    "NOK", "SEK", "DKK", "ISK", "PLN", "HUF", "CZK", "RON",
+    "BGN", "HRK", "RUB", "TRY", "ILS", "ZAR", "EGP", "NGN",
+    "KES", "MAD", "TND",
+    # Middle East
+    "SAR", "AED", "QAR", "KWD", "BHD", "OMR", "JOD",
+    # Americas
+    "MXN", "BRL", "ARS", "CLP", "COP", "PEN", "UYU",
+})
+
 _SYSTEM_PROMPT = """You are a Forex news sentiment analyst.
 Read the article supplied by the user and determine its likely short-term
 impact on a single, specific currency pair.
@@ -55,6 +84,28 @@ Rules:
 - Output JSON only. No code fences. No commentary.
 """
 
+_BATCH_SYSTEM_PROMPT = """You are a Forex news sentiment analyst.
+The user supplies a TARGET pair and a numbered list of news articles
+about it. Synthesize ALL of them into a single short-term outlook for
+that pair — do not analyse the articles separately.
+
+You MUST respond with a single JSON object and NOTHING else — no prose,
+no markdown fences, no preamble. The schema is:
+
+{
+  "sentiment":  "bullish" | "bearish" | "neutral",
+  "confidence": <float between 0.0 and 1.0>,
+  "pair":       "<the target pair, echoed verbatim>"
+}
+
+Rules:
+- "sentiment" is from the perspective of the BASE currency in "pair".
+- "confidence" reflects how strongly the *combined* articles support the
+  call. If they contradict each other, lower the confidence.
+- "pair" must echo the target pair supplied by the user.
+- Output JSON only. No code fences. No commentary.
+"""
+
 
 class ClaudeNewsAnalyzer(INewsAnalyzer):
     def __init__(
@@ -75,7 +126,21 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
 
     # ------------------------------------------------------------------
     def analyze(self, item: NewsItem) -> AnalysisResult | None:
+        if not self._mentions_allowed_pair(item):
+            log.info(
+                "Article %s only mentions non-allowed pairs; skipping Claude call",
+                item.article_id,
+            )
+            return None
+
         user_msg = self._build_user_message(item)
+        candidates = sorted(self._extract_pair_tokens(item)) or ["auto"]
+        log.info(
+            "Calling Claude (model=%s, mode=single) article=%s articles=1 pair_candidates=%s",
+            self._model,
+            item.article_id,
+            ",".join(candidates),
+        )
         try:
             response = self._client.messages.create(
                 model=self._model,
@@ -99,13 +164,179 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
             log.exception("Unexpected error calling Claude: %s", exc)
             return None
 
+        self._log_usage(f"single:{item.article_id}", response)
         text = self._extract_text(response)
         parsed = self._parse_json(text)
         if parsed is None:
             log.warning("Claude returned non-JSON for %s: %r", item.article_id, text[:200])
             return None
 
-        return self._validate(parsed, item.article_id)
+        result = self._validate(parsed, item.article_id)
+        if result is not None:
+            log.info(
+                "Claude result single:%s pair=%s sentiment=%s confidence=%.2f",
+                item.article_id,
+                result.pair,
+                result.sentiment.value,
+                result.confidence,
+            )
+        return result
+
+    # ------------------------------------------------------------------
+    # Batched analysis (issue #3)
+    # ------------------------------------------------------------------
+    def analyze_many(self, items: list[NewsItem]) -> list[AnalysisResult]:
+        """Analyze a batch of articles, consolidating multiple stories
+        about the same pair into a single Claude call.
+
+        Strategy:
+          * Articles whose text explicitly names exactly one allowed pair
+            are grouped by that pair; each group is sent in **one** Claude
+            call that returns a single consolidated AnalysisResult.
+          * Articles that don't pin to a single allowed pair (zero or many
+            matches) fall back to per-item :meth:`analyze`, where Claude
+            picks the pair on its own.
+          * Results are deduplicated by pair (highest-confidence wins) so a
+            grouped batch and an ungrouped fallback can never produce two
+            competing signals for the same instrument.
+        """
+        groups: dict[str, list[NewsItem]] = {}
+        ungrouped: list[NewsItem] = []
+        for item in items:
+            mentions = self._allowed_pair_mentions(item)
+            if len(mentions) == 1:
+                groups.setdefault(next(iter(mentions)), []).append(item)
+            else:
+                ungrouped.append(item)
+
+        results: list[AnalysisResult] = []
+        for pair, batch in groups.items():
+            res = self._analyze_pair(pair, batch)
+            if res is not None:
+                results.append(res)
+        for item in ungrouped:
+            res = self.analyze(item)
+            if res is not None:
+                results.append(res)
+
+        return self._dedupe_by_pair(results)
+
+    def _analyze_pair(
+        self, pair: str, items: list[NewsItem]
+    ) -> AnalysisResult | None:
+        """One Claude call consolidating *all* ``items`` into a signal for
+        ``pair``. Same error-handling contract as :meth:`analyze` — any
+        failure (timeout, API error, malformed JSON, schema violation)
+        returns ``None`` rather than raising.
+        """
+        if not items:
+            return None
+        tag = f"batch:{pair}({len(items)})"
+        log.info(
+            "Calling Claude (model=%s, mode=batch) pair=%s articles=%d ids=%s",
+            self._model,
+            pair,
+            len(items),
+            ",".join(item.article_id for item in items),
+        )
+        try:
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                system=[
+                    {
+                        "type": "text",
+                        "text": _BATCH_SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": self._build_batch_message(pair, items),
+                    }
+                ],
+            )
+        except anthropic.APITimeoutError:
+            log.warning("Claude timed out on %s", tag)
+            return None
+        except anthropic.APIError as exc:
+            log.error("Claude API error on %s: %s", tag, exc)
+            return None
+        except Exception as exc:  # last-resort safety net
+            log.exception("Unexpected error calling Claude on %s: %s", tag, exc)
+            return None
+
+        self._log_usage(tag, response)
+        text = self._extract_text(response)
+        parsed = self._parse_json(text)
+        if parsed is None:
+            log.warning("Claude returned non-JSON for %s: %r", tag, text[:200])
+            return None
+
+        # Enforce the target pair we supplied — Claude is told to echo it,
+        # but we don't trust it to do so under prompt drift.
+        parsed["pair"] = pair
+        result = self._validate(parsed, tag)
+        if result is not None:
+            log.info(
+                "Claude result %s sentiment=%s confidence=%.2f",
+                tag,
+                result.sentiment.value,
+                result.confidence,
+            )
+        return result
+
+    def _allowed_pair_mentions(self, item: NewsItem) -> set[str]:
+        """Return the subset of explicit pair tokens in the article that
+        are also in the configured allowlist. Empty if no allowlist or
+        no allowed pair appears in the text.
+        """
+        if not self._allowed_pairs:
+            return set()
+        return self._extract_pair_tokens(item) & self._allowed_pairs
+
+    @staticmethod
+    def _extract_pair_tokens(item: NewsItem) -> set[str]:
+        """Extract validated FX pair tokens from the article text."""
+        text = f"{item.title}\n{item.description}".upper()
+        tokens: set[str] = set()
+        for m in _PAIR_RE_CONTIGUOUS.finditer(text):
+            word = m.group(1)
+            if word[:3] in _FX_CURRENCIES and word[3:] in _FX_CURRENCIES:
+                tokens.add(word)
+        for pattern in (_PAIR_RE_DELIMITED, _PAIR_RE_SPACED):
+            for m in pattern.finditer(text):
+                base, quote = m.group(1), m.group(2)
+                if base in _FX_CURRENCIES and quote in _FX_CURRENCIES:
+                    tokens.add(base + quote)
+        return tokens
+
+    @staticmethod
+    def _dedupe_by_pair(
+        results: list[AnalysisResult],
+    ) -> list[AnalysisResult]:
+        best: dict[str, AnalysisResult] = {}
+        for r in results:
+            existing = best.get(r.pair)
+            if existing is None or r.confidence > existing.confidence:
+                best[r.pair] = r
+        return list(best.values())
+
+    # ------------------------------------------------------------------
+    def _mentions_allowed_pair(self, item: NewsItem) -> bool:
+        """Return False only when the article explicitly names FX pairs and
+        none of them are in the allowlist — then the Claude call is wasted
+        and we skip it. If no allowlist is configured, or the text contains
+        no explicit pair tokens, we let the call proceed (Claude may still
+        infer an allowed pair from context).
+        """
+        if not self._allowed_pairs:
+            return True
+        tokens = self._extract_pair_tokens(item)
+        if not tokens:
+            return True
+        return any(pair in self._allowed_pairs for pair in tokens)
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -116,6 +347,33 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
             f"Title: {item.title}\n"
             f"Description: {item.description}\n"
             f"URL: {item.url}"
+        )
+
+    @staticmethod
+    def _build_batch_message(pair: str, items: list[NewsItem]) -> str:
+        lines = [f"Target pair: {pair}", "", "Articles:"]
+        for i, item in enumerate(items, start=1):
+            lines.extend([
+                f"\n[{i}] Source: {item.source}",
+                f"    Published: {item.published_at.isoformat()}",
+                f"    Title: {item.title}",
+                f"    Description: {item.description}",
+                f"    URL: {item.url}",
+            ])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _log_usage(tag: str, response: Any) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        log.info(
+            "Claude usage %s input=%s output=%s cache_read=%s cache_create=%s",
+            tag,
+            getattr(usage, "input_tokens", "?"),
+            getattr(usage, "output_tokens", "?"),
+            getattr(usage, "cache_read_input_tokens", "?"),
+            getattr(usage, "cache_creation_input_tokens", "?"),
         )
 
     @staticmethod

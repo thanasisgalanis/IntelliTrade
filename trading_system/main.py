@@ -46,7 +46,7 @@ def build_pipeline() -> tuple[
 
     allowed_pairs = {
         p.strip().upper()
-        for p in _env("DEFAULT_PAIRS", "EURUSD").split(",")
+        for p in _env("ALLOWED_PAIRS", "EURUSD").split(",")
         if p.strip()
     }
 
@@ -74,7 +74,7 @@ def build_pipeline() -> tuple[
 
 
 def run_once() -> int:
-    log = get_logger("intelitrade")
+    log = get_logger("intellitrade")
     collector, analyzer, risk, engine = build_pipeline()
 
     sl_pips = float(_env("DEFAULT_SL_PIPS", "20"))
@@ -87,11 +87,10 @@ def run_once() -> int:
         items = collector.fetch(query=query, page_size=page_size)
         log.info("Pipeline starting on %d articles", len(items))
 
-        for item in items:
-            analysis: AnalysisResult | None = analyzer.analyze(item)
-            if analysis is None:
-                continue
+        analyses: list[AnalysisResult] = analyzer.analyze_many(items)
+        log.info("Analyzer produced %d consolidated signal(s)", len(analyses))
 
+        for analysis in analyses:
             signal = risk.evaluate(analysis, sl_pips=sl_pips, tp_pips=tp_pips)
             if signal is None:
                 continue
@@ -111,14 +110,14 @@ def run_once() -> int:
 def main() -> int:
     load_dotenv()
     configure_logging(
-        log_file=os.getenv("LOG_FILE", "logs/intelitrade.log"),
+        log_file=os.getenv("LOG_FILE", "logs/intellitrade.log"),
         level=os.getenv("LOG_LEVEL", "INFO"),
     )
     try:
         run_once()
         return 0
     except Exception as exc:
-        get_logger("intelitrade").exception("Fatal: %s", exc)
+        get_logger("intellitrade").exception("Fatal: %s", exc)
         return 1
 
 

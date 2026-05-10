@@ -26,6 +26,16 @@ from trading_system.modules.risk_manager.risk_manager import (
 
 log = get_logger(__name__)
 
+# Bitmask values for ``symbol_info.filling_mode`` per the MT5 docs:
+#   bit 0 (=1) — SYMBOL_FILLING_FOK supported
+#   bit 1 (=2) — SYMBOL_FILLING_IOC supported
+# When neither bit is set the symbol uses Exchange execution and the
+# correct order-side constant is ``ORDER_FILLING_RETURN``. Hard-coding
+# IOC for every symbol was the source of retcode=10030 ("Unsupported
+# filling mode") on brokers that only accept FOK or RETURN (issue #5).
+_SYMBOL_FILLING_FOK_BIT = 1
+_SYMBOL_FILLING_IOC_BIT = 2
+
 
 def _import_mt5() -> Any:
     try:
@@ -146,7 +156,7 @@ class MT5ExecutionEngine(IExecutionEngine):
             "magic": self._magic,
             "comment": signal.comment[:31],  # MT5 caps comment length
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": self._select_filling_mode(signal.pair),
         }
         result = mt5.order_send(request)
         if result is None:
@@ -182,3 +192,19 @@ class MT5ExecutionEngine(IExecutionEngine):
 
     def shutdown(self) -> None:
         self._session.shutdown()
+
+    # ------------------------------------------------------------------
+    def _select_filling_mode(self, pair: str) -> int:
+        """Pick a filling mode the *symbol* actually supports, derived
+        from the ``symbol_info.filling_mode`` bitmask. Preference order:
+        IOC → FOK → RETURN. RETURN is also the safe choice when the
+        bitmask is 0 (Exchange-execution symbols). See issue #5.
+        """
+        mt5 = self._mt5
+        info = mt5.symbol_info(pair)
+        mask = int(getattr(info, "filling_mode", 0) or 0) if info else 0
+        if mask & _SYMBOL_FILLING_IOC_BIT:
+            return mt5.ORDER_FILLING_IOC
+        if mask & _SYMBOL_FILLING_FOK_BIT:
+            return mt5.ORDER_FILLING_FOK
+        return mt5.ORDER_FILLING_RETURN
