@@ -95,9 +95,6 @@ Runtime config is loaded from `.env` via `python-dotenv`. See `.env.example` for
 
 `git@github.com:thanasisgalanis/IntelliTrade.git`
 
-> Note: the GitHub repo is spelled **IntelliTrade** (double-l) while the local working directory is `InteliTrade` (single-l). Worth aligning eventually.
-
-
 ## Rules
 
 - Always ask to update claude.md (this file), after any change in our code, so it reflects the current status of our codebase.

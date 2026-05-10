@@ -1,6 +1,6 @@
  ▐▛███▜▌   Claude Code v2.1.118
 ▝▜█████▛▘  Sonnet 4.6 · Claude Pro
-  ▘▘ ▝▝    ~/Projects/devItEasy/InteliTrade
+  ▘▘ ▝▝    ~/Projects/devItEasy/IntelliTrade
 
   Opus 4.7 xhigh is now available! · /model to switch
 
@@ -83,8 +83,8 @@
   parallel.
 
 ⏺ Bash(mkdir -p
-      /Users/tgalanis/Projects/devItEasy/InteliTrade/trading_system/core
-      /Users/tgalanis/Projects/devItEasy/InteliTrade/trading_system/modules/news
+      /Users/tgalanis/Projects/devItEasy/IntelliTrade/trading_system/core
+      /Users/tgalanis/Projects/devItEasy/IntelliTrade/trading_system/modules/news
       _collector…)
   ⎿  core
      modules
@@ -128,7 +128,7 @@
 ⏺ Now writing the core layer (logger + interfaces) and __init__.py files.
 ⏺ Write(trading_system/__init__.py)
   ⎿  Wrote 2 lines to trading_system/__init__.py
-      1 """InteliTrade — Phase 1 News-Trading MVP."""
+      1 """IntelliTrade — Phase 1 News-Trading MVP."""
       2 __version__ = "0.1.0"
 
 ⏺ Write(trading_system/core/__init__.py)
@@ -337,12 +337,12 @@
 
 ⏺ All 45 tests pass. Final tree check before reporting back.
 
-⏺ Bash(find /Users/tgalanis/Projects/devItEasy/InteliTrade -type f -not -path
+⏺ Bash(find /Users/tgalanis/Projects/devItEasy/lTrade -type f -not -path
       '*/\.*' -not -path '*/.venv/*' -not -path '*/__pycache__/*' | sort && echo
        "---" && git -…)
-  ⎿  /Users/tgalanis/Projects/devItEasy/InteliTrade/CLAUDE.md
-     /Users/tgalanis/Projects/devItEasy/InteliTrade/pytest.ini
-     /Users/tgalanis/Projects/devItEasy/InteliTrade/ReadMe.md
+  ⎿  /Users/tgalanis/Projects/devItEasy/IntelliTrade/CLAUDE.md
+     /Users/tgalanis/Projects/devItEasy/IntelliTrade/pytest.ini
+     /Users/tgalanis/Projects/devItEasy/IntelliTrade/ReadMe.md
      … +23 lines (ctrl+o to expand)
 
 ⏺ Phase 1 MVP is built and green. Summary:
@@ -396,7 +396,7 @@
 
 ✻ Worked for 5m 27s
 
-※ recap: Goal: build the InteliTrade Phase 1 news-trading MVP on branch feature/phase-1-news-trading-mvp. All modules, orchestrator, and 45 pytest tests are in place and passing. Next action: get your approval to commit. (disable recaps in /config)
+※ recap: Goal: build the IntelliTrade Phase 1 news-trading MVP on branch feature/phase-1-news-trading-mvp. All modules, orchestrator, and 45 pytest tests are in place and passing. Next action: get your approval to commit. (disable recaps in /config)
 
 ❯ commit staged changes as one bundle commit, show the commit message before    
   continue                                                                      
@@ -523,7 +523,7 @@
   ase-1-news-trading-mvp
 
   Heads-up: the GitHub remote is spelled IntelliTrade (double-l) while CLAUDE.md
-   shows InteliTrade — worth aligning one or the other when you get a chance.
+   shows IntelliTrade — worth aligning one or the other when you get a chance.
 
 ※ recap: Goal: build the Phase 1 news-trading MVP (modular monolith) on branch feature/phase-1-news-trading-mvp. Scaffolding, modules, orchestrator, and 45 passing tests are committed and pushed. Next: open the PR at the GitHub link. (disable recaps in /config)
 

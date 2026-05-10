@@ -74,7 +74,7 @@ def build_pipeline() -> tuple[
 
 
 def run_once() -> int:
-    log = get_logger("intelitrade")
+    log = get_logger("intellitrade")
     collector, analyzer, risk, engine = build_pipeline()
 
     sl_pips = float(_env("DEFAULT_SL_PIPS", "20"))
@@ -110,14 +110,14 @@ def run_once() -> int:
 def main() -> int:
     load_dotenv()
     configure_logging(
-        log_file=os.getenv("LOG_FILE", "logs/intelitrade.log"),
+        log_file=os.getenv("LOG_FILE", "logs/intellitrade.log"),
         level=os.getenv("LOG_LEVEL", "INFO"),
     )
     try:
         run_once()
         return 0
     except Exception as exc:
-        get_logger("intelitrade").exception("Fatal: %s", exc)
+        get_logger("intellitrade").exception("Fatal: %s", exc)
         return 1
 
 

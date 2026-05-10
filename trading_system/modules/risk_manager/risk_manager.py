@@ -123,7 +123,7 @@ class FixedPercentRiskManager(IRiskManager):
             sl_price=sl_price,
             tp_price=tp_price,
             confidence=analysis.confidence,
-            comment=f"InteliTrade conf={analysis.confidence:.2f}",
+            comment=f"IntelliTrade conf={analysis.confidence:.2f}",
         )
         log.info(
             "ACCEPT %s %s lots=%.2f SL=%.5f TP=%.5f conf=%.2f",
