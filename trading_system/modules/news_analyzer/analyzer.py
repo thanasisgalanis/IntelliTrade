@@ -31,6 +31,35 @@ _DEFAULT_TIMEOUT = 20.0  # seconds
 _REQUIRED_KEYS = {"sentiment", "confidence", "pair"}
 _VALID_SENTIMENTS = {s.value for s in Sentiment}
 
+# Three orthogonal pair-mention forms. Each is matched independently so a
+# match in one form does not consume characters that belong to another (the
+# non-overlapping behaviour of ``finditer`` would otherwise cause e.g.
+# "USD/INR AND EUR/USD" to swallow "AND EUR" between the two real pairs).
+# Both halves are post-validated against ``_FX_CURRENCIES`` to suppress
+# false positives from adjacent 3-letter acronyms (e.g. "THE ECB").
+_PAIR_RE_CONTIGUOUS = re.compile(r"\b([A-Z]{6})\b")
+_PAIR_RE_DELIMITED = re.compile(r"\b([A-Z]{3})[/\-]([A-Z]{3})\b")
+_PAIR_RE_SPACED = re.compile(r"\b([A-Z]{3})\s+([A-Z]{3})\b")
+
+# ISO 4217 codes for currencies that appear in mainstream FX coverage. The
+# list is intentionally conservative — adding a code only widens the pre-
+# filter (more articles get a Claude call), it never causes a wrongful skip.
+_FX_CURRENCIES: frozenset[str] = frozenset({
+    # Majors
+    "USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF",
+    # Asia
+    "CNY", "CNH", "HKD", "SGD", "KRW", "TWD", "INR", "IDR",
+    "MYR", "PHP", "THB", "VND", "PKR", "BDT", "LKR", "NPR",
+    # EMEA
+    "NOK", "SEK", "DKK", "ISK", "PLN", "HUF", "CZK", "RON",
+    "BGN", "HRK", "RUB", "TRY", "ILS", "ZAR", "EGP", "NGN",
+    "KES", "MAD", "TND",
+    # Middle East
+    "SAR", "AED", "QAR", "KWD", "BHD", "OMR", "JOD",
+    # Americas
+    "MXN", "BRL", "ARS", "CLP", "COP", "PEN", "UYU",
+})
+
 _SYSTEM_PROMPT = """You are a Forex news sentiment analyst.
 Read the article supplied by the user and determine its likely short-term
 impact on a single, specific currency pair.
@@ -75,6 +104,13 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
 
     # ------------------------------------------------------------------
     def analyze(self, item: NewsItem) -> AnalysisResult | None:
+        if not self._mentions_allowed_pair(item):
+            log.info(
+                "Article %s only mentions non-allowed pairs; skipping Claude call",
+                item.article_id,
+            )
+            return None
+
         user_msg = self._build_user_message(item)
         try:
             response = self._client.messages.create(
@@ -106,6 +142,35 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
             return None
 
         return self._validate(parsed, item.article_id)
+
+    # ------------------------------------------------------------------
+    def _mentions_allowed_pair(self, item: NewsItem) -> bool:
+        """Return False only when the article explicitly names FX pairs and
+        none of them are in the allowlist — then the Claude call is wasted
+        and we skip it. If no allowlist is configured, or the text contains
+        no explicit pair tokens, we let the call proceed (Claude may still
+        infer an allowed pair from context).
+        """
+        if not self._allowed_pairs:
+            return True
+        text = f"{item.title}\n{item.description}".upper()
+        mentions: set[str] = set()
+
+        for m in _PAIR_RE_CONTIGUOUS.finditer(text):
+            word = m.group(1)
+            base, quote = word[:3], word[3:]
+            if base in _FX_CURRENCIES and quote in _FX_CURRENCIES:
+                mentions.add(word)
+
+        for pattern in (_PAIR_RE_DELIMITED, _PAIR_RE_SPACED):
+            for m in pattern.finditer(text):
+                base, quote = m.group(1), m.group(2)
+                if base in _FX_CURRENCIES and quote in _FX_CURRENCIES:
+                    mentions.add(base + quote)
+
+        if not mentions:
+            return True
+        return any(pair in self._allowed_pairs for pair in mentions)
 
     # ------------------------------------------------------------------
     @staticmethod

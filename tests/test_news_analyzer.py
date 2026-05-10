@@ -27,12 +27,15 @@ from trading_system.modules.news_analyzer.analyzer import ClaudeNewsAnalyzer
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_item() -> NewsItem:
+def make_item(
+    title: str = "ECB hints at faster rate cuts",
+    description: str = "Sources suggest the ECB may accelerate cuts in Q3.",
+) -> NewsItem:
     return NewsItem(
         article_id="abc123",
         source="Reuters",
-        title="ECB hints at faster rate cuts",
-        description="Sources suggest the ECB may accelerate cuts in Q3.",
+        title=title,
+        description=description,
         url="https://example.com/article",
         published_at=datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc),
     )
@@ -203,3 +206,109 @@ def test_pair_in_allowlist_accepted():
     result = analyzer.analyze(make_item())
     assert result is not None
     assert result.pair == "EURUSD"
+
+
+# ---------------------------------------------------------------------------
+# Pre-filter: skip Claude call when only non-allowed pairs are mentioned
+# (regression for issue #2 — wasted API quota / cost on USD/INR-style articles)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "title,description",
+    [
+        ("USD/INR rises 0.4% as crude eases", "Indian rupee weakens against dollar."),
+        ("Asian FX wrap", "USDINR climbs while local stocks dip."),
+        ("Emerging FX update", "Spot USD INR last seen at 83.2 on the day."),
+        ("USD-INR session recap", "Pair settled near session highs."),
+    ],
+)
+def test_skips_api_call_when_only_non_allowed_pair_mentioned(title, description):
+    client = MagicMock(spec=anthropic.Anthropic)
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused",
+        client=client,
+        allowed_pairs={"EURUSD", "GBPUSD"},
+    )
+
+    result = analyzer.analyze(make_item(title=title, description=description))
+
+    assert result is None
+    client.messages.create.assert_not_called()
+
+
+def test_calls_api_when_allowed_pair_mentioned():
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages.create.return_value = fake_response(
+        '{"sentiment": "bullish", "confidence": 0.8, "pair": "EURUSD"}'
+    )
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused",
+        client=client,
+        allowed_pairs={"EURUSD", "GBPUSD"},
+    )
+
+    result = analyzer.analyze(
+        make_item(title="EUR/USD breaks higher", description="Euro firms vs dollar.")
+    )
+
+    assert result is not None
+    assert result.pair == "EURUSD"
+    client.messages.create.assert_called_once()
+
+
+def test_calls_api_when_mixed_pairs_include_allowed_one():
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages.create.return_value = fake_response(
+        '{"sentiment": "bullish", "confidence": 0.7, "pair": "EURUSD"}'
+    )
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused",
+        client=client,
+        allowed_pairs={"EURUSD"},
+    )
+
+    result = analyzer.analyze(
+        make_item(
+            title="USD/INR and EUR/USD diverge",
+            description="Rupee weakens while euro firms.",
+        )
+    )
+
+    assert result is not None
+    client.messages.create.assert_called_once()
+
+
+def test_calls_api_when_no_explicit_pair_mentioned():
+    """If the article has no pair token, defer to Claude — it may still
+    infer an allowed pair from context (e.g. a story about ECB policy)."""
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages.create.return_value = fake_response(
+        '{"sentiment": "bullish", "confidence": 0.8, "pair": "EURUSD"}'
+    )
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused",
+        client=client,
+        allowed_pairs={"EURUSD"},
+    )
+
+    result = analyzer.analyze(make_item())  # default item has no pair tokens
+
+    assert result is not None
+    client.messages.create.assert_called_once()
+
+
+def test_no_allowlist_disables_prefilter():
+    """Without an allowlist there's nothing to filter against — every
+    article must reach Claude as before."""
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages.create.return_value = fake_response(
+        '{"sentiment": "neutral", "confidence": 0.4, "pair": "USDINR"}'
+    )
+    analyzer = ClaudeNewsAnalyzer(api_key="unused", client=client)
+
+    result = analyzer.analyze(
+        make_item(title="USD/INR drifts", description="Rupee flat on the day.")
+    )
+
+    assert result is not None
+    client.messages.create.assert_called_once()
