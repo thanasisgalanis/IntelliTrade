@@ -46,7 +46,7 @@ def build_pipeline() -> tuple[
 
     allowed_pairs = {
         p.strip().upper()
-        for p in _env("DEFAULT_PAIRS", "EURUSD").split(",")
+        for p in _env("ALLOWED_PAIRS", "EURUSD").split(",")
         if p.strip()
     }
 

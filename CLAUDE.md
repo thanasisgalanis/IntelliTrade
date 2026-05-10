@@ -75,7 +75,7 @@ Runtime config is loaded from `.env` via `python-dotenv`. See `.env.example` for
 - `NEWSAPI_KEY`, `NEWS_QUERY`, `NEWS_LANGUAGE`, `NEWS_PAGE_SIZE` — news source
 - `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` (default `claude-sonnet-4-6`)
 - `RISK_PERCENT` (default `1.0`), `MIN_CONFIDENCE` (default `0.70`)
-- `DEFAULT_PAIRS`, `DEFAULT_SL_PIPS`, `DEFAULT_TP_PIPS`, `MAX_SLIPPAGE_POINTS`, `MAGIC_NUMBER`
+- `ALLOWED_PAIRS`, `DEFAULT_SL_PIPS`, `DEFAULT_TP_PIPS`, `MAX_SLIPPAGE_POINTS`, `MAGIC_NUMBER`
 - `SQLITE_PATH`, `LOG_FILE`, `LOG_LEVEL`
 
 ## GitHub Remote
