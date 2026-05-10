@@ -1,12 +1,23 @@
 """Anthropic Claude-backed news analyzer.
 
-The system prompt forces the model to return ONLY a JSON object with the
-exact schema defined in ``_REQUIRED_KEYS``. Any deviation (extra prose,
-malformed JSON, schema mismatch, network error, timeout) is caught and the
-analyzer returns ``None`` instead of crashing the orchestrator.
+Two paths:
 
-The static system prompt is marked ``cache_control: ephemeral`` so that
-Anthropic prompt-caching reuses it across calls.
+* :meth:`analyze` — single article, returns a single :class:`AnalysisResult`.
+  Kept for completeness and the abstract-base contract; the live pipeline
+  uses the batch path below.
+
+* :meth:`analyze_batch` — many articles in **one** ``messages.create`` call,
+  returning a per-article :class:`AnalysisResult` keyed by ``article_id``.
+  The model is required to emit a JSON object of the form
+  ``{"results": [{"article_id": "...", "sentiment": "...",
+  "confidence": 0.x, "pair": "EURUSD", "rationale": "..."}, ...]}``.
+
+A static system prompt is sent ``cache_control: ephemeral`` so Anthropic
+prompt-caching reuses it across calls.
+
+Any deviation (extra prose, malformed JSON, schema mismatch, network error,
+timeout) is caught: the affected article(s) are dropped from the result
+dict, never raised. The orchestrator therefore always gets a clean mapping.
 """
 from __future__ import annotations
 
@@ -28,8 +39,15 @@ log = get_logger(__name__)
 
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _DEFAULT_TIMEOUT = 20.0  # seconds
+_DEFAULT_BATCH_MAX_SIZE = 50
 _REQUIRED_KEYS = {"sentiment", "confidence", "pair"}
 _VALID_SENTIMENTS = {s.value for s in Sentiment}
+
+# Scale per-article token budget with batch size — the model returns one
+# JSON object per article, plus the wrapping array. 60 output tokens per
+# article is comfortable for the schema we ask for.
+_OUTPUT_TOKENS_PER_ARTICLE = 60
+_OUTPUT_TOKENS_FLOOR = 200
 
 # Three orthogonal pair-mention forms. Each is matched independently so a
 # match in one form does not consume characters that belong to another (the
@@ -84,25 +102,36 @@ Rules:
 - Output JSON only. No code fences. No commentary.
 """
 
-_BATCH_SYSTEM_PROMPT = """You are a Forex news sentiment analyst.
-The user supplies a TARGET pair and a numbered list of news articles
-about it. Synthesize ALL of them into a single short-term outlook for
-that pair — do not analyse the articles separately.
+_BATCH_ARRAY_SYSTEM_PROMPT = """You are a Forex news sentiment analyst.
+The user supplies a numbered list of news articles, each tagged with an
+``article_id``. Analyse EACH article independently — do not blend stories
+across articles — and return one JSON object per article.
 
 You MUST respond with a single JSON object and NOTHING else — no prose,
 no markdown fences, no preamble. The schema is:
 
 {
-  "sentiment":  "bullish" | "bearish" | "neutral",
-  "confidence": <float between 0.0 and 1.0>,
-  "pair":       "<the target pair, echoed verbatim>"
+  "results": [
+    {
+      "article_id": "<echo verbatim from input>",
+      "sentiment":  "bullish" | "bearish" | "neutral",
+      "confidence": <float between 0.0 and 1.0>,
+      "pair":       "<6-letter ISO pair, e.g. EURUSD>",
+      "rationale":  "<one short sentence>"
+    },
+    ...
+  ]
 }
 
 Rules:
+- One entry per input article. Echo "article_id" exactly as supplied.
 - "sentiment" is from the perspective of the BASE currency in "pair".
-- "confidence" reflects how strongly the *combined* articles support the
-  call. If they contradict each other, lower the confidence.
-- "pair" must echo the target pair supplied by the user.
+- "confidence" reflects how strongly that single article supports the
+  call; use values below 0.50 if the article is ambiguous or off-topic.
+- "pair" must be exactly 6 uppercase letters. If multiple pairs are
+  plausible, pick the single most affected one.
+- If an article is irrelevant to FX, still emit its entry with neutral
+  sentiment, low confidence, and your best-guess pair.
 - Output JSON only. No code fences. No commentary.
 """
 
@@ -116,13 +145,17 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
         max_tokens: int = 200,
         client: anthropic.Anthropic | None = None,
         allowed_pairs: set[str] | None = None,
+        batch_max_size: int = _DEFAULT_BATCH_MAX_SIZE,
     ) -> None:
         if client is None and not api_key:
             raise ValueError("Anthropic API key is required when no client is injected")
+        if batch_max_size <= 0:
+            raise ValueError("batch_max_size must be > 0")
         self._client = client or anthropic.Anthropic(api_key=api_key, timeout=timeout)
         self._model = model
         self._max_tokens = max_tokens
         self._allowed_pairs = allowed_pairs
+        self._batch_max_size = batch_max_size
 
     # ------------------------------------------------------------------
     def analyze(self, item: NewsItem) -> AnalysisResult | None:
@@ -183,119 +216,145 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
         return result
 
     # ------------------------------------------------------------------
-    # Batched analysis (issue #3)
+    # Per-article batch analysis (one Claude call per chunk of <= batch_max_size)
     # ------------------------------------------------------------------
-    def analyze_many(self, items: list[NewsItem]) -> list[AnalysisResult]:
-        """Analyze a batch of articles, consolidating multiple stories
-        about the same pair into a single Claude call.
+    def analyze_batch(
+        self, items: list[NewsItem]
+    ) -> dict[str, AnalysisResult]:
+        """Analyze a batch of articles in as few Claude calls as possible.
 
-        Strategy:
-          * Articles whose text explicitly names exactly one allowed pair
-            are grouped by that pair; each group is sent in **one** Claude
-            call that returns a single consolidated AnalysisResult.
-          * Articles that don't pin to a single allowed pair (zero or many
-            matches) fall back to per-item :meth:`analyze`, where Claude
-            picks the pair on its own.
-          * Results are deduplicated by pair (highest-confidence wins) so a
-            grouped batch and an ungrouped fallback can never produce two
-            competing signals for the same instrument.
-        """
-        groups: dict[str, list[NewsItem]] = {}
-        ungrouped: list[NewsItem] = []
-        for item in items:
-            mentions = self._allowed_pair_mentions(item)
-            if len(mentions) == 1:
-                groups.setdefault(next(iter(mentions)), []).append(item)
-            else:
-                ungrouped.append(item)
-
-        results: list[AnalysisResult] = []
-        for pair, batch in groups.items():
-            res = self._analyze_pair(pair, batch)
-            if res is not None:
-                results.append(res)
-        for item in ungrouped:
-            res = self.analyze(item)
-            if res is not None:
-                results.append(res)
-
-        return self._dedupe_by_pair(results)
-
-    def _analyze_pair(
-        self, pair: str, items: list[NewsItem]
-    ) -> AnalysisResult | None:
-        """One Claude call consolidating *all* ``items`` into a signal for
-        ``pair``. Same error-handling contract as :meth:`analyze` — any
-        failure (timeout, API error, malformed JSON, schema violation)
-        returns ``None`` rather than raising.
+        Articles whose explicit pair tokens are *all* outside the allowed
+        list are dropped before the call (issue #2 pre-filter). The
+        remainder is split into chunks of at most ``batch_max_size`` and
+        each chunk is sent in **one** ``messages.create`` call. Per-article
+        results are merged into a single ``article_id -> AnalysisResult``
+        dict.
         """
         if not items:
-            return None
-        tag = f"batch:{pair}({len(items)})"
+            return {}
+
+        eligible: list[NewsItem] = []
+        skipped: list[str] = []
+        for item in items:
+            if self._mentions_allowed_pair(item):
+                eligible.append(item)
+            else:
+                skipped.append(item.article_id)
+
+        if skipped:
+            log.info(
+                "Pre-filter: %d article(s) only mention non-allowed pairs; skipping (ids=%s)",
+                len(skipped),
+                ",".join(skipped),
+            )
+
+        if not eligible:
+            return {}
+
+        results: dict[str, AnalysisResult] = {}
+        chunks = list(_chunked(eligible, self._batch_max_size))
+        for chunk_idx, chunk in enumerate(chunks, start=1):
+            chunk_results = self._call_batch(chunk, chunk_idx, len(chunks))
+            results.update(chunk_results)
+
+        return results
+
+    def _call_batch(
+        self,
+        items: list[NewsItem],
+        chunk_idx: int,
+        chunk_total: int,
+    ) -> dict[str, AnalysisResult]:
+        tag = f"batch[{chunk_idx}/{chunk_total}]({len(items)})"
         log.info(
-            "Calling Claude (model=%s, mode=batch) pair=%s articles=%d ids=%s",
+            "Calling Claude (model=%s, mode=batch) chunk=%d/%d articles=%d ids=%s",
             self._model,
-            pair,
+            chunk_idx,
+            chunk_total,
             len(items),
             ",".join(item.article_id for item in items),
+        )
+        max_tokens = max(
+            _OUTPUT_TOKENS_FLOOR,
+            len(items) * _OUTPUT_TOKENS_PER_ARTICLE,
         )
         try:
             response = self._client.messages.create(
                 model=self._model,
-                max_tokens=self._max_tokens,
+                max_tokens=max_tokens,
                 system=[
                     {
                         "type": "text",
-                        "text": _BATCH_SYSTEM_PROMPT,
+                        "text": _BATCH_ARRAY_SYSTEM_PROMPT,
                         "cache_control": {"type": "ephemeral"},
                     }
                 ],
                 messages=[
                     {
                         "role": "user",
-                        "content": self._build_batch_message(pair, items),
+                        "content": self._build_batch_array_message(items),
                     }
                 ],
             )
         except anthropic.APITimeoutError:
             log.warning("Claude timed out on %s", tag)
-            return None
+            return {}
         except anthropic.APIError as exc:
             log.error("Claude API error on %s: %s", tag, exc)
-            return None
+            return {}
         except Exception as exc:  # last-resort safety net
             log.exception("Unexpected error calling Claude on %s: %s", tag, exc)
-            return None
+            return {}
 
         self._log_usage(tag, response)
         text = self._extract_text(response)
         parsed = self._parse_json(text)
         if parsed is None:
             log.warning("Claude returned non-JSON for %s: %r", tag, text[:200])
-            return None
+            return {}
 
-        # Enforce the target pair we supplied — Claude is told to echo it,
-        # but we don't trust it to do so under prompt drift.
-        parsed["pair"] = pair
-        result = self._validate(parsed, tag)
-        if result is not None:
+        entries = parsed.get("results") if isinstance(parsed, dict) else None
+        if not isinstance(entries, list):
+            log.warning("Claude payload missing 'results' array for %s", tag)
+            return {}
+
+        valid_ids = {item.article_id for item in items}
+        out: dict[str, AnalysisResult] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            article_id = str(entry.get("article_id", "")).strip()
+            if not article_id or article_id not in valid_ids:
+                log.warning(
+                    "%s — entry references unknown article_id=%r; dropping",
+                    tag,
+                    article_id,
+                )
+                continue
+            result = self._validate(entry, article_id)
+            if result is None:
+                continue
+            out[article_id] = result
             log.info(
-                "Claude result %s sentiment=%s confidence=%.2f",
+                "Claude result %s article=%s pair=%s sentiment=%s confidence=%.2f",
                 tag,
+                article_id,
+                result.pair,
                 result.sentiment.value,
                 result.confidence,
             )
-        return result
 
-    def _allowed_pair_mentions(self, item: NewsItem) -> set[str]:
-        """Return the subset of explicit pair tokens in the article that
-        are also in the configured allowlist. Empty if no allowlist or
-        no allowed pair appears in the text.
-        """
-        if not self._allowed_pairs:
-            return set()
-        return self._extract_pair_tokens(item) & self._allowed_pairs
+        missing = valid_ids - out.keys()
+        if missing:
+            log.warning(
+                "%s — %d article(s) had no usable result (ids=%s)",
+                tag,
+                len(missing),
+                ",".join(sorted(missing)),
+            )
+        return out
 
+    # ------------------------------------------------------------------
     @staticmethod
     def _extract_pair_tokens(item: NewsItem) -> set[str]:
         """Extract validated FX pair tokens from the article text."""
@@ -311,17 +370,6 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
                 if base in _FX_CURRENCIES and quote in _FX_CURRENCIES:
                     tokens.add(base + quote)
         return tokens
-
-    @staticmethod
-    def _dedupe_by_pair(
-        results: list[AnalysisResult],
-    ) -> list[AnalysisResult]:
-        best: dict[str, AnalysisResult] = {}
-        for r in results:
-            existing = best.get(r.pair)
-            if existing is None or r.confidence > existing.confidence:
-                best[r.pair] = r
-        return list(best.values())
 
     # ------------------------------------------------------------------
     def _mentions_allowed_pair(self, item: NewsItem) -> bool:
@@ -350,15 +398,20 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
         )
 
     @staticmethod
-    def _build_batch_message(pair: str, items: list[NewsItem]) -> str:
-        lines = [f"Target pair: {pair}", "", "Articles:"]
+    def _build_batch_array_message(items: list[NewsItem]) -> str:
+        lines = [
+            f"Articles to analyse ({len(items)}). Return one results entry per article.",
+            "",
+        ]
         for i, item in enumerate(items, start=1):
             lines.extend([
-                f"\n[{i}] Source: {item.source}",
+                f"[{i}] article_id: {item.article_id}",
+                f"    Source: {item.source}",
                 f"    Published: {item.published_at.isoformat()}",
                 f"    Title: {item.title}",
                 f"    Description: {item.description}",
                 f"    URL: {item.url}",
+                "",
             ])
         return "\n".join(lines)
 
@@ -435,3 +488,8 @@ class ClaudeNewsAnalyzer(INewsAnalyzer):
             pair=pair,
             rationale=str(payload.get("rationale", "")),
         )
+
+
+def _chunked(seq: list[NewsItem], size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]

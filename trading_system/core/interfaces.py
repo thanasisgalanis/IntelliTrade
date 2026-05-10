@@ -85,24 +85,44 @@ class INewsCollector(ABC):
     def load_recent(self, limit: int = 50) -> list[NewsItem]:
         """Read previously-stored news from local storage."""
 
+    @abstractmethod
+    def load_unanalyzed(self, limit: int | None = None) -> list[NewsItem]:
+        """Return stored articles that have not yet been analyzed."""
+
+    @abstractmethod
+    def save_analysis(self, article_id: str, result: "AnalysisResult") -> None:
+        """Persist the analyzer's verdict against the stored article."""
+
+    @abstractmethod
+    def mark_analysis_skipped(self, article_id: str, reason: str) -> None:
+        """Stamp an article as processed-but-not-analyzed (e.g. pre-filter
+        skipped it) so it does not re-enter the work queue."""
+
 
 class INewsAnalyzer(ABC):
     @abstractmethod
     def analyze(self, item: NewsItem) -> AnalysisResult | None:
         """Return a structured signal or None if analysis failed/was skipped."""
 
-    def analyze_many(self, items: list[NewsItem]) -> list[AnalysisResult]:
-        """Analyze a batch of items.
+    def analyze_batch(
+        self, items: list[NewsItem]
+    ) -> dict[str, AnalysisResult]:
+        """Per-article batch analysis.
 
-        Default: per-item iteration. Implementations may override to
-        deduplicate or batch external API calls across items targeting the
-        same instrument (see issue #3).
+        Returns a mapping ``article_id -> AnalysisResult`` containing only
+        the articles for which the analyzer produced a valid result.
+        Articles that were filtered out, timed out, or returned malformed
+        output are simply absent from the dict.
+
+        The default implementation falls back to per-item :meth:`analyze`;
+        production implementations override it to consolidate the calls
+        into one external request (see :class:`ClaudeNewsAnalyzer`).
         """
-        results: list[AnalysisResult] = []
+        results: dict[str, AnalysisResult] = {}
         for item in items:
             r = self.analyze(item)
             if r is not None:
-                results.append(r)
+                results[item.article_id] = r
         return results
 
 

@@ -316,85 +316,84 @@ def test_no_allowlist_disables_prefilter():
 
 
 # ---------------------------------------------------------------------------
-# Batched analysis — issue #3 regressions
-# (multiple articles for the same pair must collapse into one Claude call,
-#  and competing signals for one pair must dedupe to a single result.)
+# Per-article batch analysis (analyze_batch)
+# Contract:
+#   * one Claude call per chunk of <= batch_max_size
+#   * pre-filter drops articles whose only pair tokens are non-allowed
+#   * returns dict[article_id -> AnalysisResult] with only valid entries
 # ---------------------------------------------------------------------------
 
-def test_analyze_many_groups_articles_about_same_pair_into_one_call():
-    """Three articles all naming GBP/USD must reach Claude as a single
-    batch request, producing one consolidated AnalysisResult."""
+def fake_batch_response(entries: list[dict]) -> SimpleNamespace:
+    """Build a fake response wrapping the new {"results": [...]} schema."""
+    import json as _json
+    return fake_response(_json.dumps({"results": entries}))
+
+
+def _entry(article_id, sentiment="bullish", confidence=0.8, pair="EURUSD",
+           rationale="ok"):
+    return {
+        "article_id": article_id,
+        "sentiment": sentiment,
+        "confidence": confidence,
+        "pair": pair,
+        "rationale": rationale,
+    }
+
+
+def test_analyze_batch_single_call_for_many_articles():
+    """N articles -> 1 Claude call -> N per-article results keyed by id."""
     client = MagicMock(spec=anthropic.Anthropic)
-    client.messages.create.return_value = fake_response(
-        '{"sentiment": "bullish", "confidence": 0.82, "pair": "GBPUSD"}'
-    )
+    client.messages.create.return_value = fake_batch_response([
+        _entry("a1", pair="EURUSD", confidence=0.7),
+        _entry("a2", pair="GBPUSD", sentiment="bearish", confidence=0.6),
+        _entry("a3", pair="EURUSD", sentiment="neutral", confidence=0.4),
+    ])
     analyzer = ClaudeNewsAnalyzer(
-        api_key="unused", client=client, allowed_pairs={"GBPUSD"},
+        api_key="unused", client=client, allowed_pairs={"EURUSD", "GBPUSD"},
     )
 
     items = [
-        make_item(article_id="a1", title="GBP/USD breaks higher",
-                  description="Sterling firms vs dollar."),
-        make_item(article_id="a2", title="Cable extends rally on GBP/USD",
-                  description="Pound hits new high vs USD."),
-        make_item(article_id="a3", title="GBPUSD outlook upgraded",
-                  description="Analysts revise GBP/USD targets."),
+        make_item(article_id="a1", title="EUR/USD up", description="euro firms"),
+        make_item(article_id="a2", title="GBP/USD weak", description="cable down"),
+        make_item(article_id="a3", title="EUR/USD wobble", description="mixed signals"),
     ]
 
-    results = analyzer.analyze_many(items)
+    out = analyzer.analyze_batch(items)
 
     assert client.messages.create.call_count == 1
-    assert len(results) == 1
-    assert results[0].pair == "GBPUSD"
-    assert results[0].sentiment is Sentiment.BULLISH
-    assert results[0].confidence == pytest.approx(0.82)
+    assert set(out.keys()) == {"a1", "a2", "a3"}
+    assert out["a1"].pair == "EURUSD"
+    assert out["a2"].pair == "GBPUSD"
+    assert out["a2"].sentiment is Sentiment.BEARISH
+    assert out["a3"].sentiment is Sentiment.NEUTRAL
 
 
-def test_analyze_many_uses_one_call_per_distinct_pair():
-    """Articles about different allowed pairs each trigger their own
-    batch call — never one shared call for unrelated pairs."""
+def test_analyze_batch_chunks_at_batch_max_size():
+    """Articles in excess of batch_max_size span multiple Claude calls."""
     client = MagicMock(spec=anthropic.Anthropic)
+    # First chunk: a1, a2. Second chunk: a3.
     client.messages.create.side_effect = [
-        fake_response('{"sentiment": "bullish", "confidence": 0.8, "pair": "GBPUSD"}'),
-        fake_response('{"sentiment": "bearish", "confidence": 0.7, "pair": "EURUSD"}'),
+        fake_batch_response([_entry("a1"), _entry("a2")]),
+        fake_batch_response([_entry("a3")]),
     ]
-    analyzer = ClaudeNewsAnalyzer(
-        api_key="unused", client=client, allowed_pairs={"GBPUSD", "EURUSD"},
-    )
-
-    items = [
-        make_item(article_id="g1", title="GBP/USD up", description="cable firms"),
-        make_item(article_id="g2", title="GBPUSD higher", description="pound up"),
-        make_item(article_id="e1", title="EUR/USD slips", description="euro down"),
-    ]
-
-    results = analyzer.analyze_many(items)
-
-    assert client.messages.create.call_count == 2
-    assert {r.pair for r in results} == {"GBPUSD", "EURUSD"}
-
-
-def test_analyze_many_falls_back_to_single_when_no_pair_token():
-    """An article with no explicit pair token can't be grouped — it must
-    still reach Claude via the single-article path."""
-    client = MagicMock(spec=anthropic.Anthropic)
-    client.messages.create.return_value = fake_response(
-        '{"sentiment": "neutral", "confidence": 0.4, "pair": "EURUSD"}'
-    )
     analyzer = ClaudeNewsAnalyzer(
         api_key="unused", client=client, allowed_pairs={"EURUSD"},
+        batch_max_size=2,
     )
 
-    results = analyzer.analyze_many([make_item()])  # default has no pair tokens
+    items = [
+        make_item(article_id=f"a{i}", title=f"EUR/USD {i}", description="euro")
+        for i in (1, 2, 3)
+    ]
 
-    assert client.messages.create.call_count == 1
-    assert len(results) == 1
-    assert results[0].pair == "EURUSD"
+    out = analyzer.analyze_batch(items)
+
+    assert client.messages.create.call_count == 2
+    assert set(out.keys()) == {"a1", "a2", "a3"}
 
 
-def test_analyze_many_skips_articles_for_non_allowed_pairs():
-    """Issue #2 pre-filter still applies inside the batch flow: USD/INR
-    articles never reach the API."""
+def test_analyze_batch_pre_filters_non_allowed_pairs():
+    """Pre-filter (issue #2) still applies: only non-allowed pair => no API call."""
     client = MagicMock(spec=anthropic.Anthropic)
     analyzer = ClaudeNewsAnalyzer(
         api_key="unused", client=client, allowed_pairs={"EURUSD"},
@@ -405,144 +404,137 @@ def test_analyze_many_skips_articles_for_non_allowed_pairs():
         make_item(article_id="x2", title="USDINR climbs", description="dollar up"),
     ]
 
-    assert analyzer.analyze_many(items) == []
+    assert analyzer.analyze_batch(items) == {}
     client.messages.create.assert_not_called()
 
 
-def test_analyze_many_combines_grouped_and_ungrouped_paths():
+def test_analyze_batch_pre_filter_keeps_eligible_articles():
+    """Mixed list: pre-filtered ones drop, eligible ones reach Claude."""
     client = MagicMock(spec=anthropic.Anthropic)
-    client.messages.create.side_effect = [
-        # Batch call for the GBP/USD group
-        fake_response('{"sentiment": "bullish", "confidence": 0.8, "pair": "GBPUSD"}'),
-        # Single-article fallback (no pair token) — Claude infers EURUSD
-        fake_response('{"sentiment": "bearish", "confidence": 0.6, "pair": "EURUSD"}'),
-    ]
+    client.messages.create.return_value = fake_batch_response([
+        _entry("a1", pair="EURUSD"),
+    ])
     analyzer = ClaudeNewsAnalyzer(
-        api_key="unused", client=client, allowed_pairs={"GBPUSD", "EURUSD"},
+        api_key="unused", client=client, allowed_pairs={"EURUSD"},
     )
 
     items = [
-        make_item(article_id="g1", title="GBP/USD news", description="cable"),
-        make_item(article_id="g2", title="GBPUSD outlook", description="sterling"),
-        make_item(article_id="u1"),  # default — no pair token, ungrouped
+        make_item(article_id="x1", title="USD/INR drift", description="rupee"),
+        make_item(article_id="a1", title="EUR/USD up", description="euro firms"),
     ]
 
-    results = analyzer.analyze_many(items)
+    out = analyzer.analyze_batch(items)
 
-    assert client.messages.create.call_count == 2
-    assert {r.pair for r in results} == {"GBPUSD", "EURUSD"}
-
-
-def test_analyze_many_dedupes_by_pair_keeping_highest_confidence():
-    """If batched and ungrouped paths both yield a signal for the same
-    pair, the higher-confidence one wins — never two trades for one pair."""
-    client = MagicMock(spec=anthropic.Anthropic)
-    client.messages.create.side_effect = [
-        fake_response('{"sentiment": "bullish", "confidence": 0.55, "pair": "GBPUSD"}'),
-        fake_response('{"sentiment": "bullish", "confidence": 0.85, "pair": "GBPUSD"}'),
-    ]
-    analyzer = ClaudeNewsAnalyzer(
-        api_key="unused", client=client, allowed_pairs={"GBPUSD"},
-    )
-
-    items = [
-        make_item(article_id="g1", title="GBP/USD news", description="cable"),
-        make_item(article_id="u1"),  # ungrouped → individual call
-    ]
-
-    results = analyzer.analyze_many(items)
-
-    assert len(results) == 1
-    assert results[0].pair == "GBPUSD"
-    assert results[0].confidence == pytest.approx(0.85)
+    assert client.messages.create.call_count == 1
+    assert set(out.keys()) == {"a1"}
 
 
-def test_analyze_many_handles_malformed_batch_response():
-    """If a batch call returns garbage, that pair is dropped — other
-    pairs in the same run are unaffected."""
-    client = MagicMock(spec=anthropic.Anthropic)
-    client.messages.create.side_effect = [
-        fake_response("not json"),  # GBPUSD batch fails
-        fake_response('{"sentiment": "bullish", "confidence": 0.7, "pair": "EURUSD"}'),
-    ]
-    analyzer = ClaudeNewsAnalyzer(
-        api_key="unused", client=client, allowed_pairs={"GBPUSD", "EURUSD"},
-    )
-
-    items = [
-        make_item(article_id="g1", title="GBP/USD up", description="cable"),
-        make_item(article_id="e1", title="EUR/USD down", description="euro"),
-    ]
-
-    results = analyzer.analyze_many(items)
-
-    assert client.messages.create.call_count == 2
-    assert len(results) == 1
-    assert results[0].pair == "EURUSD"
-
-
-def test_analyze_many_empty_input_makes_no_api_calls():
+def test_analyze_batch_empty_input_makes_no_api_call():
     client = MagicMock(spec=anthropic.Anthropic)
     analyzer = ClaudeNewsAnalyzer(
         api_key="unused", client=client, allowed_pairs={"EURUSD"},
     )
 
-    assert analyzer.analyze_many([]) == []
+    assert analyzer.analyze_batch([]) == {}
     client.messages.create.assert_not_called()
 
 
-def test_analyze_many_overrides_pair_when_claude_misformats_it():
-    """The batch path passes the target pair to Claude and trusts our own
-    detection — not whatever the model echoes back."""
+def test_analyze_batch_drops_entries_for_unknown_article_ids():
+    """Claude must echo back valid article_ids; hallucinated ones are dropped."""
     client = MagicMock(spec=anthropic.Anthropic)
-    # Claude returns a *different* pair than the one we asked about.
-    client.messages.create.return_value = fake_response(
-        '{"sentiment": "bullish", "confidence": 0.8, "pair": "EURUSD"}'
-    )
+    client.messages.create.return_value = fake_batch_response([
+        _entry("a1", pair="EURUSD"),
+        _entry("ghost", pair="EURUSD"),  # not in input
+    ])
     analyzer = ClaudeNewsAnalyzer(
-        api_key="unused", client=client, allowed_pairs={"GBPUSD"},
+        api_key="unused", client=client, allowed_pairs={"EURUSD"},
+    )
+
+    items = [make_item(article_id="a1", title="EUR/USD up", description="euro")]
+
+    out = analyzer.analyze_batch(items)
+
+    assert set(out.keys()) == {"a1"}
+
+
+def test_analyze_batch_drops_entries_for_non_allowed_pair_in_response():
+    """Even if Claude returns a non-allowed pair, the row is dropped (allowlist)."""
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages.create.return_value = fake_batch_response([
+        _entry("a1", pair="USDJPY"),   # not allowed
+        _entry("a2", pair="EURUSD"),   # allowed
+    ])
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused", client=client, allowed_pairs={"EURUSD"},
     )
 
     items = [
-        make_item(article_id="g1", title="GBP/USD up", description="cable"),
-        make_item(article_id="g2", title="GBPUSD higher", description="pound"),
+        make_item(article_id="a1", title="some FX news", description="x"),
+        make_item(article_id="a2", title="EUR/USD update", description="y"),
     ]
 
-    results = analyzer.analyze_many(items)
+    out = analyzer.analyze_batch(items)
 
-    assert len(results) == 1
-    assert results[0].pair == "GBPUSD"  # not EURUSD
+    assert set(out.keys()) == {"a2"}
 
 
-def test_analyze_many_batch_message_contains_every_article():
-    """All articles in a group must appear in the single user message —
-    otherwise Claude is consolidating from incomplete evidence."""
+def test_analyze_batch_handles_malformed_response():
+    """Garbage response => empty dict, no crash."""
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages.create.return_value = fake_response("not json")
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused", client=client, allowed_pairs={"EURUSD"},
+    )
+
+    items = [make_item(article_id="a1", title="EUR/USD up", description="euro")]
+
+    assert analyzer.analyze_batch(items) == {}
+
+
+def test_analyze_batch_handles_timeout():
+    timeout = anthropic.APITimeoutError(request=MagicMock())
+    client = MagicMock(spec=anthropic.Anthropic)
+    client.messages.create.side_effect = timeout
+    analyzer = ClaudeNewsAnalyzer(
+        api_key="unused", client=client, allowed_pairs={"EURUSD"},
+    )
+
+    items = [make_item(article_id="a1", title="EUR/USD up", description="euro")]
+
+    assert analyzer.analyze_batch(items) == {}
+
+
+def test_analyze_batch_message_contains_every_article():
+    """The single user message must list every article verbatim — otherwise
+    Claude analyses incomplete evidence."""
     captured: dict = {}
 
     def capture(**kwargs):
         captured.update(kwargs)
-        return fake_response(
-            '{"sentiment": "bullish", "confidence": 0.8, "pair": "GBPUSD"}'
-        )
+        return fake_batch_response([
+            _entry("a1", pair="EURUSD"),
+            _entry("a2", pair="EURUSD"),
+        ])
 
     client = MagicMock(spec=anthropic.Anthropic)
     client.messages.create.side_effect = capture
     analyzer = ClaudeNewsAnalyzer(
-        api_key="unused", client=client, allowed_pairs={"GBPUSD"},
+        api_key="unused", client=client, allowed_pairs={"EURUSD"},
     )
 
     items = [
-        make_item(article_id="a1", title="GBP/USD breaks 1.30",
-                  description="Sterling spikes on jobs data."),
-        make_item(article_id="a2", title="Cable extends GBP/USD gains",
-                  description="Pound rallies on hawkish BoE tone."),
+        make_item(article_id="a1", title="EUR/USD breaks 1.10",
+                  description="Euro firms on hawkish ECB."),
+        make_item(article_id="a2", title="ECB tone shifts EUR/USD",
+                  description="Yields rise; euro extends gains."),
     ]
 
-    analyzer.analyze_many(items)
+    analyzer.analyze_batch(items)
 
     body = captured["messages"][0]["content"]
-    assert "Target pair: GBPUSD" in body
-    assert "breaks 1.30" in body
-    assert "Cable extends GBP/USD gains" in body
-    assert "Sterling spikes on jobs data." in body
-    assert "hawkish BoE tone." in body
+    assert "article_id: a1" in body
+    assert "article_id: a2" in body
+    assert "breaks 1.10" in body
+    assert "ECB tone shifts EUR/USD" in body
+    assert "Euro firms on hawkish ECB." in body
+    assert "Yields rise; euro extends gains." in body
